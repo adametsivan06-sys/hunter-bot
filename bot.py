@@ -594,19 +594,19 @@ async def periodic_check(context: ContextTypes.DEFAULT_TYPE):
             save_state(STATE)
         return
 
-    # немає активного хантера — перевіряємо чи мали бути (в межах робочого дня і є призначені)
+    # немає активного хантера — після 13:00 нагадуємо кожні 10 хв, доки не розпочнуть зміну
     hour = datetime.now(TZ).hour
-    if 9 <= hour < 21 and STATE["today_hunters"]:
+    if hour >= 13 and STATE["today_hunters"]:
         last_alert = STATE.get("last_missing_alert")
         need_alert = True
         if last_alert:
             since = (datetime.now(TZ) - parse_iso(last_alert)).total_seconds()
-            need_alert = since >= 30 * 60  # не частіше ніж раз на 30 хв
+            need_alert = since >= 10 * 60  # кожні 10 хв
         if need_alert:
             await context.bot.send_message(
                 chat_id=chat_id,
                 message_thread_id=STATE.get("thread_id"),
-                text="🚨 Хантер не на місці! Зараз ніхто не веде чергування.",
+                text="🚨 Хантер ще не на місці!",
             )
             STATE["last_missing_alert"] = now_iso()
             save_state(STATE)
