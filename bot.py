@@ -3,19 +3,23 @@ Hunter J087 Telegram Bot
 -------------------------
 Контроль чергування "хантера" (підхід до покупців) у групі магазину.
 
+Після /chatid бот сам створює й ЗАКРІПЛЮЄ повідомлення-меню в групі —
+далі команди вводити не потрібно, все через кнопки в закріпленому повідомленні.
+(Дай боту права адміністратора з правом «Закріплювати повідомлення».)
+
 Команди:
-  /menu                     — відкрити меню з кнопками (почати/передати/завершити/налаштування)
+  /menu                     — відкрити/оновити закріплене меню
   /chatid                 — показати ID групи (виконати один раз у групі, щоб зареєструвати її)
   /employees               — показати список працівників
   /addemployee Ім'я1, Ім'я2 — додати одного чи кількох працівників
   /removeemployee Ім'я1, Ім'я2 — видалити одного чи кількох працівників
   /setemployees Ім'я1, Ім'я2 — повністю замінити список працівників
-  /sethunters Ім'я1, Ім'я2 — призначити хантерів на сьогодні (робити зранку)
-  /todayhunters             — хто сьогодні в пулі хантерів
+  /sethunters текст         — задати розклад хантерів на сьогодні (довільний текст)
+  /todayhunters             — показати сьогоднішній розклад
   /starthunter Ім'я         — почати зміну хантера
   /transferhunter Ім'я      — передати зміну іншому
   /endhunter                — завершити зміну
-  /status                   — поточний статус
+  /status                   — поточний статус (з таймером зміни)
   /setinterval Години       — інтервал перевірки "ти на місці?" (за замовч. 2)
   /setactivity Текст        — поточна активність/акція, буде в нагадуваннях
   /help                     — список команд
@@ -27,7 +31,7 @@ import os
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -48,7 +52,9 @@ DEFAULT_STATE = {
     "chat_id": None,
     "thread_id": None,
     "employees": ["Владислав", "Іван", "Олександр", "Діана", "Тетяна"],
-    "today_hunters": [],
+    "hunters_schedule_text": None,   # довільний текст розкладу хантерів на день
+    "schedule_sent_date": None,      # коли востаннє надсилали розклад о 12:00
+    "menu_message_id": None,         # id закріпленого повідомлення-меню
     "today_date": None,
     "current_session": None,   # {"employee":..., "start_time":..., "last_check_in":..., "transfers":[...]}
     "log": [],
@@ -108,10 +114,11 @@ def today_str():
 
 
 def ensure_today_reset():
-    """Скидає пул хантерів дня, якщо настав новий день."""
+    """Скидає розклад/пул хантерів дня, якщо настав новий день."""
     if STATE.get("today_date") != today_str():
         STATE["today_date"] = today_str()
-        STATE["today_hunters"] = []
+        STATE["hunters_schedule_text"] = None
+        STATE["schedule_sent_date"] = None
         save_state(STATE)
 
 
@@ -122,6 +129,45 @@ async def require_chat(update: Update) -> bool:
         )
         return False
     return True
+
+
+async def push_pinned(context: ContextTypes.DEFAULT_TYPE, text: str, markup) -> None:
+    """Показує текст/кнопки в ОДНОМУ закріпленому повідомленні-меню.
+    Якщо воно вже існує — редагує його, якщо ні — створює і закріплює."""
+    chat_id = STATE.get("chat_id")
+    if not chat_id:
+        return
+    mid = STATE.get("menu_message_id")
+    if mid:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=mid, text=text, reply_markup=markup
+            )
+            return
+        except Exception:
+            pass  # повідомлення видалили/не змінилось — створюємо нове нижче
+    try:
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=STATE.get("thread_id"),
+            text=text,
+            reply_markup=markup,
+        )
+    except Exception as e:
+        log.error("push_pinned send failed: %s", e)
+        return
+    STATE["menu_message_id"] = msg.message_id
+    save_state(STATE)
+    try:
+        await context.bot.pin_chat_message(
+            chat_id=chat_id, message_id=msg.message_id, disable_notification=True
+        )
+    except Exception as e:
+        log.warning("Не вдалось закріпити меню (потрібні права адміна): %s", e)
+
+
+async def ensure_pinned_menu(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await push_pinned(context, main_menu_text(), build_main_menu())
 
 
 # ---------------- команди ----------------
@@ -139,8 +185,11 @@ async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     where = f", гілка {thread_id}" if STATE["thread_id"] else ""
     await update.message.reply_text(
         f"✅ Групу зареєстровано (chat_id={update.effective_chat.id}{where}). "
-        f"Автоматичні повідомлення надходитимуть саме сюди."
+        f"Автоматичні повідомлення надходитимуть саме сюди.\n\n"
+        f"Нижче — закріплене меню, ним і користуйтесь, команди більше не потрібні "
+        f"(якщо закріплення не спрацювало — дай боту права адміністратора з правом «Закріплювати повідомлення»)."
     )
+    await ensure_pinned_menu(context)
 
 
 async def cmd_employees(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -213,28 +262,25 @@ async def cmd_removeemployee(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def cmd_sethunters(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_today_reset()
-    text = " ".join(context.args)
-    names = [n.strip() for n in text.split(",") if n.strip()]
-    unknown = [n for n in names if n not in STATE["employees"]]
-    if unknown:
+    text = " ".join(context.args).strip()
+    if not text:
         await update.message.reply_text(
-            f"⚠️ Немає в списку працівників: {', '.join(unknown)}\n"
-            f"Спочатку додай через /addemployee, або перевір написання."
+            "Використання: /sethunters текст розкладу\n"
+            "Наприклад: /sethunters 12:00-15:00 Іван, 15:00-18:00 Олена"
         )
         return
-    STATE["today_hunters"] = names
-    STATE["today_date"] = today_str()
+    STATE["hunters_schedule_text"] = text
+    STATE["schedule_sent_date"] = None
     STATE["last_missing_alert"] = None
     save_state(STATE)
-    await update.message.reply_text(
-        f"✅ Хантери на сьогодні ({today_str()}): {', '.join(names) if names else '—'}"
-    )
+    await update.message.reply_text(f"✅ Розклад хантерів на сьогодні збережено:\n{text}")
+    await ensure_pinned_menu(context)
 
 
 async def cmd_todayhunters(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_today_reset()
-    names = ", ".join(STATE["today_hunters"]) or "ще не призначені"
-    await update.message.reply_text(f"Хантери на сьогодні: {names}")
+    text = STATE.get("hunters_schedule_text") or "розклад ще не задано"
+    await update.message.reply_text(f"Розклад хантерів на сьогодні:\n{text}")
 
 
 async def cmd_setactivity(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -267,12 +313,6 @@ async def cmd_starthunter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = " ".join(context.args).strip()
     if not name:
         await update.message.reply_text("Використання: /starthunter Ім'я")
-        return
-    if STATE["today_hunters"] and name not in STATE["today_hunters"]:
-        await update.message.reply_text(
-            f"⚠️ {name} не в сьогоднішньому списку хантерів ({', '.join(STATE['today_hunters'])}).\n"
-            f"Онови через /sethunters, якщо потрібно."
-        )
         return
     if STATE["current_session"]:
         await update.message.reply_text(
@@ -326,16 +366,15 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_today_reset()
     session = STATE["current_session"]
     if not session:
-        hunters = ", ".join(STATE["today_hunters"]) or "не призначені"
+        schedule = STATE.get("hunters_schedule_text") or "не задано"
         await update.message.reply_text(
-            f"НЕАКТИВНО — Hunter зараз не працює.\nСьогоднішні хантери: {hunters}"
+            f"НЕАКТИВНО — Hunter зараз не працює.\nРозклад на сьогодні: {schedule}"
         )
         return
-    elapsed = (datetime.now(TZ) - parse_iso(session["last_check_in"])).total_seconds()
+    since_start = (datetime.now(TZ) - parse_iso(session["start_time"])).total_seconds()
     await update.message.reply_text(
         f"АКТИВНО — {session['employee']}\n"
-        f"З моменту останньої перевірки: {fmt_duration(elapsed)}\n"
-        f"Зміна триває з: {fmt_time(session['start_time'])}\n"
+        f"⏱ На зміні: {fmt_duration(since_start)} (з {fmt_time(session['start_time'])})\n"
         f"Активність: {STATE['activity_text']}"
     )
 
@@ -356,7 +395,7 @@ def build_main_menu():
 
 def build_employee_menu(prefix, exclude=None):
     exclude = exclude or set()
-    candidates = STATE["today_hunters"] or STATE["employees"]
+    candidates = STATE["employees"]
     rows, row = [], []
     for name in candidates:
         if name in exclude:
@@ -373,7 +412,7 @@ def build_employee_menu(prefix, exclude=None):
 
 def build_settings_menu():
     rows = [
-        [InlineKeyboardButton("📋 Хантери на день", callback_data="settings_sethunters")],
+        [InlineKeyboardButton("📋 Розклад хантерів на день", callback_data="settings_sethunters")],
         [InlineKeyboardButton("📝 Змінити активність", callback_data="settings_activity")],
         [InlineKeyboardButton("⏱ Інтервал перевірки", callback_data="settings_interval")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")],
@@ -389,21 +428,21 @@ def build_interval_menu():
 
 def main_menu_text():
     session = STATE["current_session"]
+    schedule = STATE.get("hunters_schedule_text") or "не задано"
     if session:
-        elapsed = (datetime.now(TZ) - parse_iso(session["last_check_in"])).total_seconds()
+        since_start = (datetime.now(TZ) - parse_iso(session["start_time"])).total_seconds()
         return (
             f"📋 Меню\n\n"
-            f"АКТИВНО — {session['employee']}\n"
-            f"З моменту останньої перевірки: {fmt_duration(elapsed)}\n"
-            f"Зміна триває з: {fmt_time(session['start_time'])}\n"
-            f"Активність: {STATE['activity_text']}"
+            f"🟢 АКТИВНО — {session['employee']}\n"
+            f"⏱ На зміні: {fmt_duration(since_start)} (почав {fmt_time(session['start_time'])})\n"
+            f"Активність: {STATE['activity_text']}\n\n"
+            f"Розклад на сьогодні: {schedule}"
         )
-    hunters = ", ".join(STATE["today_hunters"]) or "не призначені"
     return (
         f"📋 Меню\n\n"
-        f"НЕАКТИВНО — Hunter зараз не працює.\n"
-        f"Сьогоднішні хантери: {hunters}\n"
-        f"Активність: {STATE['activity_text']}"
+        f"🔴 НЕАКТИВНО — Hunter зараз не працює.\n"
+        f"Активність: {STATE['activity_text']}\n\n"
+        f"Розклад на сьогодні: {schedule}"
     )
 
 
@@ -411,7 +450,11 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_today_reset()
     if not await require_chat(update):
         return
-    await update.message.reply_text(main_menu_text(), reply_markup=build_main_menu())
+    await ensure_pinned_menu(context)
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
 
 
 async def on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -427,16 +470,13 @@ async def on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         STATE["thread_id"] = thread_id
         save_state(STATE)
 
+    # тримаємо в курсі, яке саме повідомлення є нашим закріпленим меню
+    if STATE.get("menu_message_id") != query.message.message_id:
+        STATE["menu_message_id"] = query.message.message_id
+        save_state(STATE)
+
     async def show_main():
         await query.edit_message_text(main_menu_text(), reply_markup=build_main_menu())
-
-    async def resend_main():
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            message_thread_id=STATE.get("thread_id"),
-            text=main_menu_text(),
-            reply_markup=build_main_menu(),
-        )
 
     if data == "back_main":
         await show_main()
@@ -477,9 +517,10 @@ async def on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         STATE["current_session"] = None
         save_state(STATE)
         await query.edit_message_text(
-            f"🔴 Хантерство завершено ({session['employee']}). Тривалість: {fmt_duration(duration)}"
+            f"🔴 Хантерство завершено ({session['employee']}). Тривалість: {fmt_duration(duration)}\n\n"
+            f"{main_menu_text()}",
+            reply_markup=build_main_menu(),
         )
-        await resend_main()
         return
 
     if data.startswith("start_emp:"):
@@ -494,8 +535,10 @@ async def on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         STATE["last_missing_alert"] = None
         save_state(STATE)
-        await query.edit_message_text(f"🟢 Хантерство почав: {name} ({fmt_time(ts)})")
-        await resend_main()
+        await query.edit_message_text(
+            f"🟢 Хантерство почав: {name} ({fmt_time(ts)})\n\n{main_menu_text()}",
+            reply_markup=build_main_menu(),
+        )
         return
 
     if data.startswith("transfer_emp:"):
@@ -510,8 +553,10 @@ async def on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session["employee"] = name
         session["last_check_in"] = ts
         save_state(STATE)
-        await query.edit_message_text(f"🔄 Хантерство передано: {name} ({fmt_time(ts)})")
-        await resend_main()
+        await query.edit_message_text(
+            f"🔄 Хантерство передано: {name} ({fmt_time(ts)})\n\n{main_menu_text()}",
+            reply_markup=build_main_menu(),
+        )
         return
 
     if data == "menu_settings":
@@ -522,8 +567,11 @@ async def on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         STATE["pending_input"] = {"type": "sethunters", "chat_id": query.message.chat_id}
         save_state(STATE)
         await query.edit_message_text(
-            "Напиши імена хантерів на сьогодні через кому (наприклад: Іван, Олена).\n"
-            "Просто надішли текст наступним повідомленням у цей чат."
+            "Напиши розклад хантерів на сьогодні (будь-який текст), наприклад:\n"
+            "«12:00-15:00 Іван, 15:00-18:00 Олена»\n\n"
+            "❗️ДАЙ ВІДПОВІДЬ (Reply) на це повідомлення з текстом розкладу — "
+            "просто довге натискання на нього → «Відповісти», інакше Telegram "
+            "може не передати повідомлення боту."
         )
         return
 
@@ -531,8 +579,9 @@ async def on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         STATE["pending_input"] = {"type": "activity", "chat_id": query.message.chat_id}
         save_state(STATE)
         await query.edit_message_text(
-            "Напиши, яка зараз проходить активність/акція.\n"
-            "Просто надішли текст наступним повідомленням у цей чат."
+            "Напиши, яка зараз проходить активність/акція.\n\n"
+            "❗️ДАЙ ВІДПОВІДЬ (Reply) на це повідомлення з текстом — "
+            "довге натискання на нього → «Відповісти»."
         )
         return
 
@@ -547,8 +596,10 @@ async def on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         hours = float(data.split(":", 1)[1])
         STATE["interval_hours"] = hours
         save_state(STATE)
-        await query.edit_message_text(f"✅ Інтервал перевірки: кожні {hours} год")
-        await resend_main()
+        await query.edit_message_text(
+            f"✅ Інтервал перевірки: кожні {hours} год\n\n{main_menu_text()}",
+            reply_markup=build_main_menu(),
+        )
         return
 
 
@@ -563,32 +614,21 @@ async def on_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if pending["type"] == "sethunters":
         ensure_today_reset()
-        names = [n.strip() for n in text.split(",") if n.strip()]
-        unknown = [n for n in names if n not in STATE["employees"]]
-        if unknown:
-            await update.message.reply_text(
-                f"⚠️ Немає в списку працівників: {', '.join(unknown)}\n"
-                f"Спочатку додай через /addemployee, або перевір написання й спробуй ще раз."
-            )
-            return
-        STATE["today_hunters"] = names
-        STATE["today_date"] = today_str()
+        STATE["hunters_schedule_text"] = text
+        STATE["schedule_sent_date"] = None
         STATE["last_missing_alert"] = None
         STATE["pending_input"] = None
         save_state(STATE)
-        await update.message.reply_text(
-            f"✅ Хантери на сьогодні: {', '.join(names) if names else '—'}",
-            reply_markup=build_main_menu(),
-        )
+        await update.message.reply_text(f"✅ Розклад збережено:\n{text}")
+        await ensure_pinned_menu(context)
         return
 
     if pending["type"] == "activity":
         STATE["activity_text"] = text
         STATE["pending_input"] = None
         save_state(STATE)
-        await update.message.reply_text(
-            f"✅ Активність оновлено: {text}", reply_markup=build_main_menu()
-        )
+        await update.message.reply_text(f"✅ Активність оновлено: {text}")
+        await ensure_pinned_menu(context)
         return
 
 
@@ -639,7 +679,7 @@ async def periodic_check(context: ContextTypes.DEFAULT_TYPE):
 
     # немає активного хантера — після 13:00 нагадуємо кожні 10 хв, доки не розпочнуть зміну
     hour = datetime.now(TZ).hour
-    if hour >= 13 and STATE["today_hunters"]:
+    if hour >= 13 and STATE.get("hunters_schedule_text"):
         last_alert = STATE.get("last_missing_alert")
         need_alert = True
         if last_alert:
@@ -655,27 +695,67 @@ async def periodic_check(context: ContextTypes.DEFAULT_TYPE):
             save_state(STATE)
 
 
+async def noon_broadcast(context: ContextTypes.DEFAULT_TYPE):
+    """О 12:00 надсилає розклад хантерів (якщо заданий) і відкриває меню початку зміни."""
+    ensure_today_reset()
+    if STATE["chat_id"] is None:
+        return
+    schedule = STATE.get("hunters_schedule_text")
+    if not schedule:
+        return  # розклад на сьогодні ще не задали — нічого слати
+    if STATE.get("schedule_sent_date") == today_str():
+        return  # вже надсилали сьогодні
+    await context.bot.send_message(
+        chat_id=STATE["chat_id"],
+        message_thread_id=STATE.get("thread_id"),
+        text=f"🗒 Розклад хантерів на сьогодні:\n{schedule}",
+    )
+    STATE["schedule_sent_date"] = today_str()
+    save_state(STATE)
+    if not STATE["current_session"]:
+        # відразу відкриваємо вибір "хто починає" в закріпленому меню
+        await push_pinned(
+            context,
+            "Хто починає хантерство? Обери зі списку:",
+            build_employee_menu("start_emp"),
+        )
+    else:
+        await ensure_pinned_menu(context)
+
+
 async def morning_prompt(context: ContextTypes.DEFAULT_TYPE):
     ensure_today_reset()
     if STATE["chat_id"] is None:
         return
-    if STATE["today_hunters"]:
+    if STATE.get("hunters_schedule_text"):
         return
     await context.bot.send_message(
         chat_id=STATE["chat_id"],
         message_thread_id=STATE.get("thread_id"),
         text=(
-            "🌅 Доброго ранку! Хто сьогодні хантери?\n"
-            "Надішли: /sethunters Ім'я1, Ім'я2"
+            "🌅 Доброго ранку! Який розклад хантерів на сьогодні?\n"
+            "Задай через меню (⚙️ Налаштування → 📋 Розклад хантерів на день) "
+            "або командою /sethunters текст розкладу."
         ),
     )
+
+
+async def post_init(app: Application) -> None:
+    await app.bot.set_my_commands([
+        BotCommand("menu", "Відкрити меню"),
+        BotCommand("chatid", "Зареєструвати групу"),
+        BotCommand("status", "Поточний статус"),
+        BotCommand("employees", "Список працівників"),
+        BotCommand("sethunters", "Задати розклад хантерів"),
+        BotCommand("help", "Список команд"),
+    ])
 
 
 def main():
     if not BOT_TOKEN:
         raise SystemExit("Задай змінну середовища BOT_TOKEN з токеном від BotFather")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("start", cmd_help))
@@ -700,6 +780,7 @@ def main():
     jq = app.job_queue
     jq.run_repeating(periodic_check, interval=300, first=10)  # кожні 5 хв
     jq.run_daily(morning_prompt, time=dtime(hour=9, minute=0, tzinfo=TZ))
+    jq.run_daily(noon_broadcast, time=dtime(hour=12, minute=0, tzinfo=TZ))
 
     log.info("Bot starting...")
     app.run_polling()
