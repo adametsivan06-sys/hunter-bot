@@ -42,6 +42,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
 DEFAULT_STATE = {
     "chat_id": None,
+    "thread_id": None,
     "employees": ["Владислав", "Іван", "Олександр", "Діана", "Тетяна"],
     "today_hunters": [],
     "today_date": None,
@@ -126,8 +127,15 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     STATE["chat_id"] = update.effective_chat.id
+    thread_id = getattr(update.message, "message_thread_id", None)
+    is_topic = getattr(update.message, "is_topic_message", False)
+    STATE["thread_id"] = thread_id if is_topic else None
     save_state(STATE)
-    await update.message.reply_text(f"✅ Групу зареєстровано (chat_id={update.effective_chat.id})")
+    where = f", гілка {thread_id}" if STATE["thread_id"] else ""
+    await update.message.reply_text(
+        f"✅ Групу зареєстровано (chat_id={update.effective_chat.id}{where}). "
+        f"Автоматичні повідомлення надходитимуть саме сюди."
+    )
 
 
 async def cmd_employees(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -317,6 +325,7 @@ async def periodic_check(context: ContextTypes.DEFAULT_TYPE):
             )
             await context.bot.send_message(
                 chat_id=chat_id,
+                message_thread_id=STATE.get("thread_id"),
                 text=(
                     f"⏰ {session['employee']}, ти на місці?\n"
                     f"Активність: {STATE['activity_text']}"
@@ -340,6 +349,7 @@ async def periodic_check(context: ContextTypes.DEFAULT_TYPE):
         if need_alert:
             await context.bot.send_message(
                 chat_id=chat_id,
+                message_thread_id=STATE.get("thread_id"),
                 text="🚨 Хантер не на місці! Зараз ніхто не веде чергування.",
             )
             STATE["last_missing_alert"] = now_iso()
@@ -354,6 +364,7 @@ async def morning_prompt(context: ContextTypes.DEFAULT_TYPE):
         return
     await context.bot.send_message(
         chat_id=STATE["chat_id"],
+        message_thread_id=STATE.get("thread_id"),
         text=(
             "🌅 Доброго ранку! Хто сьогодні хантери?\n"
             "Надішли: /sethunters Ім'я1, Ім'я2"
