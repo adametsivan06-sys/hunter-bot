@@ -4,6 +4,7 @@ Hunter J087 Telegram Bot
 Контроль чергування "хантера" (підхід до покупців) у групі магазину.
 
 Команди:
+  /menu                     — відкрити меню з кнопками (почати/передати/завершити/налаштування)
   /chatid                 — показати ID групи (виконати один раз у групі, щоб зареєструвати її)
   /employees               — показати список працівників
   /addemployee Ім'я        — додати працівника
@@ -30,7 +31,9 @@ from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -51,6 +54,7 @@ DEFAULT_STATE = {
     "interval_hours": 2,
     "activity_text": "Активність не вказана",
     "last_missing_alert": None,
+    "pending_input": None,  # {"type": "sethunters"|"activity", "chat_id": ...}
 }
 
 
@@ -293,6 +297,258 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ---------------- меню (inline-кнопки) ----------------
+
+def build_main_menu():
+    session = STATE["current_session"]
+    rows = []
+    if session:
+        rows.append([InlineKeyboardButton("🔄 Передати хантерство", callback_data="menu_transfer")])
+        rows.append([InlineKeyboardButton("🔴 Завершити хантерство", callback_data="menu_end")])
+    else:
+        rows.append([InlineKeyboardButton("🟢 Почати хантерство", callback_data="menu_start")])
+    rows.append([InlineKeyboardButton("⚙️ Налаштування", callback_data="menu_settings")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_employee_menu(prefix, exclude=None):
+    exclude = exclude or set()
+    candidates = STATE["today_hunters"] or STATE["employees"]
+    rows, row = [], []
+    for name in candidates:
+        if name in exclude:
+            continue
+        row.append(InlineKeyboardButton(name, callback_data=f"{prefix}:{name}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_settings_menu():
+    rows = [
+        [InlineKeyboardButton("📋 Хантери на день", callback_data="settings_sethunters")],
+        [InlineKeyboardButton("📝 Змінити активність", callback_data="settings_activity")],
+        [InlineKeyboardButton("⏱ Інтервал перевірки", callback_data="settings_interval")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def build_interval_menu():
+    hours_options = [1, 2, 3, 4, 6]
+    row = [InlineKeyboardButton(f"{h} год", callback_data=f"interval_set:{h}") for h in hours_options]
+    return InlineKeyboardMarkup([row, [InlineKeyboardButton("⬅️ Назад", callback_data="menu_settings")]])
+
+
+def main_menu_text():
+    session = STATE["current_session"]
+    if session:
+        elapsed = (datetime.now(TZ) - parse_iso(session["last_check_in"])).total_seconds()
+        return (
+            f"📋 Меню\n\n"
+            f"АКТИВНО — {session['employee']}\n"
+            f"З моменту останньої перевірки: {fmt_duration(elapsed)}\n"
+            f"Зміна триває з: {fmt_time(session['start_time'])}\n"
+            f"Активність: {STATE['activity_text']}"
+        )
+    hunters = ", ".join(STATE["today_hunters"]) or "не призначені"
+    return (
+        f"📋 Меню\n\n"
+        f"НЕАКТИВНО — Hunter зараз не працює.\n"
+        f"Сьогоднішні хантери: {hunters}\n"
+        f"Активність: {STATE['activity_text']}"
+    )
+
+
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_today_reset()
+    if not await require_chat(update):
+        return
+    await update.message.reply_text(main_menu_text(), reply_markup=build_main_menu())
+
+
+async def on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    ensure_today_reset()
+
+    # реєструємо чат/гілку, якщо ще не зареєстровані (щоб фонові перевірки й тут працювали)
+    if STATE["chat_id"] is None:
+        STATE["chat_id"] = query.message.chat_id
+        thread_id = getattr(query.message, "message_thread_id", None)
+        STATE["thread_id"] = thread_id
+        save_state(STATE)
+
+    async def show_main():
+        await query.edit_message_text(main_menu_text(), reply_markup=build_main_menu())
+
+    async def resend_main():
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            message_thread_id=STATE.get("thread_id"),
+            text=main_menu_text(),
+            reply_markup=build_main_menu(),
+        )
+
+    if data == "back_main":
+        await show_main()
+        return
+
+    if data == "menu_start":
+        if STATE["current_session"]:
+            await query.answer("Hunter вже активний.", show_alert=True)
+            await show_main()
+            return
+        await query.edit_message_text(
+            "Хто починає хантерство? Обери зі списку:",
+            reply_markup=build_employee_menu("start_emp"),
+        )
+        return
+
+    if data == "menu_transfer":
+        session = STATE["current_session"]
+        if not session:
+            await query.answer("Зараз немає активного Hunter.", show_alert=True)
+            await show_main()
+            return
+        await query.edit_message_text(
+            "Кому передати хантерство?",
+            reply_markup=build_employee_menu("transfer_emp", exclude={session["employee"]}),
+        )
+        return
+
+    if data == "menu_end":
+        session = STATE["current_session"]
+        if not session:
+            await query.answer("Зараз немає активного Hunter.", show_alert=True)
+            await show_main()
+            return
+        end_ts = now_iso()
+        duration = (parse_iso(end_ts) - parse_iso(session["start_time"])).total_seconds()
+        STATE["log"].insert(0, {**session, "end_time": end_ts})
+        STATE["current_session"] = None
+        save_state(STATE)
+        await query.edit_message_text(
+            f"🔴 Хантерство завершено ({session['employee']}). Тривалість: {fmt_duration(duration)}"
+        )
+        await resend_main()
+        return
+
+    if data.startswith("start_emp:"):
+        name = data.split(":", 1)[1]
+        if STATE["current_session"]:
+            await query.answer("Hunter вже активний.", show_alert=True)
+            await show_main()
+            return
+        ts = now_iso()
+        STATE["current_session"] = {
+            "employee": name, "start_time": ts, "last_check_in": ts, "transfers": []
+        }
+        STATE["last_missing_alert"] = None
+        save_state(STATE)
+        await query.edit_message_text(f"🟢 Хантерство почав: {name} ({fmt_time(ts)})")
+        await resend_main()
+        return
+
+    if data.startswith("transfer_emp:"):
+        name = data.split(":", 1)[1]
+        session = STATE["current_session"]
+        if not session:
+            await query.answer("Зараз немає активного Hunter.", show_alert=True)
+            await show_main()
+            return
+        ts = now_iso()
+        session["transfers"].append({"from": session["employee"], "to": name, "time": ts})
+        session["employee"] = name
+        session["last_check_in"] = ts
+        save_state(STATE)
+        await query.edit_message_text(f"🔄 Хантерство передано: {name} ({fmt_time(ts)})")
+        await resend_main()
+        return
+
+    if data == "menu_settings":
+        await query.edit_message_text("⚙️ Налаштування:", reply_markup=build_settings_menu())
+        return
+
+    if data == "settings_sethunters":
+        STATE["pending_input"] = {"type": "sethunters", "chat_id": query.message.chat_id}
+        save_state(STATE)
+        await query.edit_message_text(
+            "Напиши імена хантерів на сьогодні через кому (наприклад: Іван, Олена).\n"
+            "Просто надішли текст наступним повідомленням у цей чат."
+        )
+        return
+
+    if data == "settings_activity":
+        STATE["pending_input"] = {"type": "activity", "chat_id": query.message.chat_id}
+        save_state(STATE)
+        await query.edit_message_text(
+            "Напиши, яка зараз проходить активність/акція.\n"
+            "Просто надішли текст наступним повідомленням у цей чат."
+        )
+        return
+
+    if data == "settings_interval":
+        await query.edit_message_text(
+            f"Поточний інтервал перевірки: кожні {STATE['interval_hours']} год.\nОбери новий:",
+            reply_markup=build_interval_menu(),
+        )
+        return
+
+    if data.startswith("interval_set:"):
+        hours = float(data.split(":", 1)[1])
+        STATE["interval_hours"] = hours
+        save_state(STATE)
+        await query.edit_message_text(f"✅ Інтервал перевірки: кожні {hours} год")
+        await resend_main()
+        return
+
+
+async def on_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ловить текст, коли бот щойно запитав дані через кнопку налаштувань."""
+    pending = STATE.get("pending_input")
+    if not pending:
+        return
+    if update.effective_chat.id != pending.get("chat_id"):
+        return
+    text = update.message.text.strip()
+
+    if pending["type"] == "sethunters":
+        ensure_today_reset()
+        names = [n.strip() for n in text.split(",") if n.strip()]
+        unknown = [n for n in names if n not in STATE["employees"]]
+        if unknown:
+            await update.message.reply_text(
+                f"⚠️ Немає в списку працівників: {', '.join(unknown)}\n"
+                f"Спочатку додай через /addemployee, або перевір написання й спробуй ще раз."
+            )
+            return
+        STATE["today_hunters"] = names
+        STATE["today_date"] = today_str()
+        STATE["last_missing_alert"] = None
+        STATE["pending_input"] = None
+        save_state(STATE)
+        await update.message.reply_text(
+            f"✅ Хантери на сьогодні: {', '.join(names) if names else '—'}",
+            reply_markup=build_main_menu(),
+        )
+        return
+
+    if pending["type"] == "activity":
+        STATE["activity_text"] = text
+        STATE["pending_input"] = None
+        save_state(STATE)
+        await update.message.reply_text(
+            f"✅ Активність оновлено: {text}", reply_markup=build_main_menu()
+        )
+        return
+
+
 # ---------------- callback (кнопка "я на місці") ----------------
 
 async def on_checkin_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -392,7 +648,10 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("setinterval", cmd_setinterval))
     app.add_handler(CommandHandler("setactivity", cmd_setactivity))
+    app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CallbackQueryHandler(on_checkin_button, pattern="^checkin$"))
+    app.add_handler(CallbackQueryHandler(on_menu_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_input))
 
     jq = app.job_queue
     jq.run_repeating(periodic_check, interval=300, first=10)  # кожні 5 хв
