@@ -7,8 +7,9 @@ Hunter J087 Telegram Bot
   /menu                     — відкрити меню з кнопками (почати/передати/завершити/налаштування)
   /chatid                 — показати ID групи (виконати один раз у групі, щоб зареєструвати її)
   /employees               — показати список працівників
-  /addemployee Ім'я        — додати працівника
-  /removeemployee Ім'я     — видалити працівника
+  /addemployee Ім'я1, Ім'я2 — додати одного чи кількох працівників
+  /removeemployee Ім'я1, Ім'я2 — видалити одного чи кількох працівників
+  /setemployees Ім'я1, Ім'я2 — повністю замінити список працівників
   /sethunters Ім'я1, Ім'я2 — призначити хантерів на сьогодні (робити зранку)
   /todayhunters             — хто сьогодні в пулі хантерів
   /starthunter Ім'я         — почати зміну хантера
@@ -147,25 +148,67 @@ async def cmd_employees(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Працівники:\n{names}")
 
 
-async def cmd_addemployee(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = " ".join(context.args).strip()
-    if not name:
-        await update.message.reply_text("Використання: /addemployee Ім'я")
+async def cmd_setemployees(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Повністю замінює список працівників (весь колектив одним повідомленням)."""
+    text = " ".join(context.args).strip()
+    if not text:
+        await update.message.reply_text(
+            "Використання: /setemployees Ім'я1, Ім'я2, Ім'я3\n"
+            "⚠️ Це ПОВНІСТЮ замінить поточний список працівників."
+        )
         return
-    if name not in STATE["employees"]:
-        STATE["employees"].append(name)
+    names = [n.strip() for n in text.split(",") if n.strip()]
+    STATE["employees"] = names
+    save_state(STATE)
+    await update.message.reply_text(
+        f"✅ Список працівників оновлено ({len(names)}):\n" + "\n".join(f"• {n}" for n in names)
+    )
+
+
+async def cmd_addemployee(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = " ".join(context.args).strip()
+    if not text:
+        await update.message.reply_text(
+            "Використання: /addemployee Ім'я\n"
+            "Можна одразу кілька через кому: /addemployee Іван, Олена, Владислав"
+        )
+        return
+    names = [n.strip() for n in text.split(",") if n.strip()]
+    added = [n for n in names if n not in STATE["employees"]]
+    already = [n for n in names if n in STATE["employees"]]
+    for n in added:
+        STATE["employees"].append(n)
+    if added:
         save_state(STATE)
-    await update.message.reply_text(f"✅ Додано: {name}")
+    parts = []
+    if added:
+        parts.append(f"✅ Додано: {', '.join(added)}")
+    if already:
+        parts.append(f"ℹ️ Вже були в списку: {', '.join(already)}")
+    await update.message.reply_text("\n".join(parts))
 
 
 async def cmd_removeemployee(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = " ".join(context.args).strip()
-    if name in STATE["employees"]:
-        STATE["employees"].remove(name)
+    text = " ".join(context.args).strip()
+    if not text:
+        await update.message.reply_text(
+            "Використання: /removeemployee Ім'я\n"
+            "Можна одразу кілька через кому: /removeemployee Іван, Олена"
+        )
+        return
+    names = [n.strip() for n in text.split(",") if n.strip()]
+    removed = [n for n in names if n in STATE["employees"]]
+    unknown = [n for n in names if n not in STATE["employees"]]
+    for n in removed:
+        STATE["employees"].remove(n)
+    if removed:
         save_state(STATE)
-        await update.message.reply_text(f"🗑 Видалено: {name}")
-    else:
-        await update.message.reply_text("Такого працівника немає в списку.")
+    parts = []
+    if removed:
+        parts.append(f"🗑 Видалено: {', '.join(removed)}")
+    if unknown:
+        parts.append(f"⚠️ Немає в списку: {', '.join(unknown)}")
+    await update.message.reply_text("\n".join(parts) or "Нічого не змінено.")
 
 
 async def cmd_sethunters(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -640,6 +683,7 @@ def main():
     app.add_handler(CommandHandler("employees", cmd_employees))
     app.add_handler(CommandHandler("addemployee", cmd_addemployee))
     app.add_handler(CommandHandler("removeemployee", cmd_removeemployee))
+    app.add_handler(CommandHandler("setemployees", cmd_setemployees))
     app.add_handler(CommandHandler("sethunters", cmd_sethunters))
     app.add_handler(CommandHandler("todayhunters", cmd_todayhunters))
     app.add_handler(CommandHandler("starthunter", cmd_starthunter))
