@@ -170,6 +170,23 @@ async def ensure_pinned_menu(context: ContextTypes.DEFAULT_TYPE) -> None:
     await push_pinned(context, main_menu_text(), build_main_menu())
 
 
+async def announce(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    """Надсилає ОКРЕМЕ повідомлення в групу (на відміну від редагування
+    закріпленого меню) — щоб старт/передача/завершення хантерства були
+    помітні у стрічці чату, а не губились у тихому редагуванні pinned-меню."""
+    chat_id = STATE.get("chat_id")
+    if not chat_id:
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=STATE.get("thread_id"),
+            text=text,
+        )
+    except Exception as e:
+        log.error("announce failed: %s", e)
+
+
 # ---------------- команди ----------------
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -327,6 +344,7 @@ async def cmd_starthunter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     STATE["last_missing_alert"] = None
     save_state(STATE)
     await update.message.reply_text(f"🟢 Hunter почав: {name} ({fmt_time(ts)})")
+    await announce(context, f"🟢 Хантерство розпочав {name} ({fmt_time(ts)})")
 
 
 async def cmd_transferhunter(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -345,6 +363,7 @@ async def cmd_transferhunter(update: Update, context: ContextTypes.DEFAULT_TYPE)
     STATE["current_session"]["last_check_in"] = ts
     save_state(STATE)
     await update.message.reply_text(f"🔄 Hunter передано: {name} ({fmt_time(ts)})")
+    await announce(context, f"🔄 Хантерство передано: {name} ({fmt_time(ts)})")
 
 
 async def cmd_endhunter(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -359,6 +378,11 @@ async def cmd_endhunter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_state(STATE)
     await update.message.reply_text(
         f"🔴 Hunter завершено. Тривалість: {fmt_duration(duration)}"
+    )
+    await announce(
+        context,
+        f"🔴 Хантерство завершено ({session['employee']}). "
+        f"Тривалість: {fmt_duration(duration)}",
     )
 
 
@@ -521,6 +545,11 @@ async def on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{main_menu_text()}",
             reply_markup=build_main_menu(),
         )
+        await announce(
+            context,
+            f"🔴 Хантерство завершено ({session['employee']}). "
+            f"Тривалість: {fmt_duration(duration)}",
+        )
         return
 
     if data.startswith("start_emp:"):
@@ -539,6 +568,7 @@ async def on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🟢 Хантерство почав: {name} ({fmt_time(ts)})\n\n{main_menu_text()}",
             reply_markup=build_main_menu(),
         )
+        await announce(context, f"🟢 Хантерство розпочав {name} ({fmt_time(ts)})")
         return
 
     if data.startswith("transfer_emp:"):
@@ -557,6 +587,7 @@ async def on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔄 Хантерство передано: {name} ({fmt_time(ts)})\n\n{main_menu_text()}",
             reply_markup=build_main_menu(),
         )
+        await announce(context, f"🔄 Хантерство передано: {name} ({fmt_time(ts)})")
         return
 
     if data == "menu_settings":
@@ -677,22 +708,28 @@ async def periodic_check(context: ContextTypes.DEFAULT_TYPE):
             save_state(STATE)
         return
 
-    # немає активного хантера — після 13:00 нагадуємо кожні 10 хв, доки не розпочнуть зміну
-    hour = datetime.now(TZ).hour
-    if hour >= 13 and STATE.get("hunters_schedule_text"):
-        last_alert = STATE.get("last_missing_alert")
-        need_alert = True
-        if last_alert:
-            since = (datetime.now(TZ) - parse_iso(last_alert)).total_seconds()
-            need_alert = since >= 10 * 60  # кожні 10 хв
-        if need_alert:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                message_thread_id=STATE.get("thread_id"),
-                text="🚨 Хантер ще не на місці!",
-            )
-            STATE["last_missing_alert"] = now_iso()
-            save_state(STATE)
+    # немає активного хантера — з 13:00 нагадуємо щоразу через 15 хв,
+    # поки хтось не розпочне зміну. Тільки якщо на сьогодні заданий
+    # текстовий розклад хантерів — якщо розклад не задано (наприклад,
+    # магазин вихідний), бот мовчить і не турбує команду.
+    if not STATE.get("hunters_schedule_text"):
+        return
+    now = datetime.now(TZ)
+    if now.hour < 13:
+        return
+    last_alert = STATE.get("last_missing_alert")
+    need_alert = True
+    if last_alert:
+        since = (now - parse_iso(last_alert)).total_seconds()
+        need_alert = since >= 15 * 60  # кожні 15 хв
+    if need_alert:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=STATE.get("thread_id"),
+            text="🚨 Ще ніхто не розпочав хантерство сьогодні!",
+        )
+        STATE["last_missing_alert"] = now_iso()
+        save_state(STATE)
 
 
 async def noon_broadcast(context: ContextTypes.DEFAULT_TYPE):
