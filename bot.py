@@ -23,6 +23,12 @@ Hunter J087 Telegram Bot
   /setinterval Години       — інтервал перевірки "ти на місці?" (за замовч. 2)
   /setactivity Текст        — поточна активність/акція, буде в нагадуваннях
   /help                     — список команд
+
+Повітряна тривога:
+  Кнопка "🚨 Повітряна тривога" / "🔕 Відбій" в меню — ручна пауза/продовження
+  всіх автоматичних нагадувань (checkin, "ще ніхто не почав").
+  Якщо задано ALERTS_API_TOKEN — бот сам стежить за тривогою в м. Києві
+  через alerts.in.ua і вмикає/вимикає паузу автоматично.
 """
 
 import json
@@ -61,6 +67,8 @@ DEFAULT_STATE = {
     "interval_hours": 2,
     "activity_text": "Активність не вказана",
     "last_missing_alert": None,
+    "hunter_done_today": False,   # True, якщо хантерство сьогодні вже відбулось і завершилось
+    "air_raid_active": False,     # True на час повітряної тривоги — паузить нагадування
     "pending_input": None,  # {"type": "sethunters"|"activity", "chat_id": ...}
 }
 
@@ -119,6 +127,7 @@ def ensure_today_reset():
         STATE["today_date"] = today_str()
         STATE["hunters_schedule_text"] = None
         STATE["schedule_sent_date"] = None
+        STATE["hunter_done_today"] = False
         save_state(STATE)
 
 
@@ -289,6 +298,7 @@ async def cmd_sethunters(update: Update, context: ContextTypes.DEFAULT_TYPE):
     STATE["hunters_schedule_text"] = text
     STATE["schedule_sent_date"] = None
     STATE["last_missing_alert"] = None
+    STATE["hunter_done_today"] = False
     save_state(STATE)
     await update.message.reply_text(f"✅ Розклад хантерів на сьогодні збережено:\n{text}")
     await ensure_pinned_menu(context)
@@ -375,6 +385,7 @@ async def cmd_endhunter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     duration = (parse_iso(end_ts) - parse_iso(session["start_time"])).total_seconds()
     STATE["log"].insert(0, {**session, "end_time": end_ts})
     STATE["current_session"] = None
+    STATE["hunter_done_today"] = True
     save_state(STATE)
     await update.message.reply_text(
         f"🔴 Hunter завершено. Тривалість: {fmt_duration(duration)}"
@@ -413,6 +424,10 @@ def build_main_menu():
         rows.append([InlineKeyboardButton("🔴 Завершити хантерство", callback_data="menu_end")])
     else:
         rows.append([InlineKeyboardButton("🟢 Почати хантерство", callback_data="menu_start")])
+    if STATE.get("air_raid_active"):
+        rows.append([InlineKeyboardButton("🔕 Відбій", callback_data="alarm_off")])
+    else:
+        rows.append([InlineKeyboardButton("🚨 Повітряна тривога", callback_data="alarm_on")])
     rows.append([InlineKeyboardButton("⚙️ Налаштування", callback_data="menu_settings")])
     return InlineKeyboardMarkup(rows)
 
@@ -453,10 +468,12 @@ def build_interval_menu():
 def main_menu_text():
     session = STATE["current_session"]
     schedule = STATE.get("hunters_schedule_text") or "не задано"
+    alarm_banner = "🚨 ПОВІТРЯНА ТРИВОГА — хантерство на паузі\n\n" if STATE.get("air_raid_active") else ""
     if session:
         since_start = (datetime.now(TZ) - parse_iso(session["start_time"])).total_seconds()
         return (
             f"📋 Меню\n\n"
+            f"{alarm_banner}"
             f"🟢 АКТИВНО — {session['employee']}\n"
             f"⏱ На зміні: {fmt_duration(since_start)} (почав {fmt_time(session['start_time'])})\n"
             f"Активність: {STATE['activity_text']}\n\n"
@@ -464,6 +481,7 @@ def main_menu_text():
         )
     return (
         f"📋 Меню\n\n"
+        f"{alarm_banner}"
         f"🔴 НЕАКТИВНО — Hunter зараз не працює.\n"
         f"Активність: {STATE['activity_text']}\n\n"
         f"Розклад на сьогодні: {schedule}"
@@ -479,6 +497,27 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.delete()
     except Exception:
         pass
+
+
+async def set_air_raid(context: ContextTypes.DEFAULT_TYPE, active: bool, source: str = "manual"):
+    """Вмикає/вимикає паузу через повітряну тривогу і сповіщає групу.
+    source: 'manual' (кнопка) або 'auto' (alerts.in.ua)."""
+    if STATE.get("air_raid_active") == active:
+        return  # вже в потрібному стані — нема чого дублювати
+    STATE["air_raid_active"] = active
+    save_state(STATE)
+    tag = "" if source == "manual" else " (авто)"
+    if active:
+        await announce(context, f"🚨 Повітряна тривога{tag}! Хантерство призупинено.")
+    else:
+        # скидаємо таймер "чи на місці", щоб одразу після відбою не прилетіло нагадування
+        session = STATE.get("current_session")
+        if session:
+            session["last_check_in"] = now_iso()
+        STATE["last_missing_alert"] = None
+        save_state(STATE)
+        await announce(context, f"🔕 Відбій{tag}. Хантерство продовжується.")
+    await ensure_pinned_menu(context)
 
 
 async def on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -504,6 +543,14 @@ async def on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "back_main":
         await show_main()
+        return
+
+    if data == "alarm_on":
+        await set_air_raid(context, True, source="manual")
+        return
+
+    if data == "alarm_off":
+        await set_air_raid(context, False, source="manual")
         return
 
     if data == "menu_start":
@@ -539,6 +586,7 @@ async def on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         duration = (parse_iso(end_ts) - parse_iso(session["start_time"])).total_seconds()
         STATE["log"].insert(0, {**session, "end_time": end_ts})
         STATE["current_session"] = None
+        STATE["hunter_done_today"] = True
         save_state(STATE)
         await query.edit_message_text(
             f"🔴 Хантерство завершено ({session['employee']}). Тривалість: {fmt_duration(duration)}\n\n"
@@ -648,6 +696,7 @@ async def on_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         STATE["hunters_schedule_text"] = text
         STATE["schedule_sent_date"] = None
         STATE["last_missing_alert"] = None
+        STATE["hunter_done_today"] = False
         STATE["pending_input"] = None
         save_state(STATE)
         await update.message.reply_text(f"✅ Розклад збережено:\n{text}")
@@ -672,7 +721,9 @@ async def on_checkin_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if session:
         session["last_check_in"] = now_iso()
         save_state(STATE)
-        await query.edit_message_text(f"✅ Підтверджено, {session['employee']} на місці.")
+        await query.edit_message_text(
+            f"✅ Підтверджено: {session['employee']} на місці й проінформував покупців."
+        )
     else:
         await query.edit_message_text("Hunter вже не активний.")
 
@@ -683,6 +734,8 @@ async def periodic_check(context: ContextTypes.DEFAULT_TYPE):
     ensure_today_reset()
     if STATE["chat_id"] is None:
         return
+    if STATE.get("air_raid_active"):
+        return  # на час тривоги всі автоматичні нагадування призупинені
     chat_id = STATE["chat_id"]
     session = STATE["current_session"]
 
@@ -691,14 +744,15 @@ async def periodic_check(context: ContextTypes.DEFAULT_TYPE):
         threshold = STATE["interval_hours"] * 3600
         if elapsed >= threshold:
             keyboard = InlineKeyboardMarkup(
-                [[InlineKeyboardButton("✅ Так, я на місці", callback_data="checkin")]]
+                [[InlineKeyboardButton("✅ Так, на місці й проінформував", callback_data="checkin")]]
             )
             await context.bot.send_message(
                 chat_id=chat_id,
                 message_thread_id=STATE.get("thread_id"),
                 text=(
                     f"⏰ {session['employee']}, ти на місці?\n"
-                    f"Активність: {STATE['activity_text']}"
+                    f"Активність: {STATE['activity_text']}\n\n"
+                    f"Проінформував покупців про нашу активність?"
                 ),
                 reply_markup=keyboard,
             )
@@ -713,6 +767,9 @@ async def periodic_check(context: ContextTypes.DEFAULT_TYPE):
     # текстовий розклад хантерів — якщо розклад не задано (наприклад,
     # магазин вихідний), бот мовчить і не турбує команду.
     if not STATE.get("hunters_schedule_text"):
+        return
+    # якщо хантерство сьогодні вже відбулось і завершилось — більше не нагадуємо
+    if STATE.get("hunter_done_today"):
         return
     now = datetime.now(TZ)
     if now.hour < 13:
@@ -730,6 +787,37 @@ async def periodic_check(context: ContextTypes.DEFAULT_TYPE):
         )
         STATE["last_missing_alert"] = now_iso()
         save_state(STATE)
+
+
+# ---------------- авто-виявлення повітряної тривоги (alerts.in.ua) ----------------
+
+ALERTS_API_TOKEN = os.environ.get("ALERTS_API_TOKEN", "")
+ALERTS_REGION_UID = os.environ.get("ALERTS_REGION_UID", "31")  # 31 = м. Київ
+
+async def check_air_raid_api(context: ContextTypes.DEFAULT_TYPE):
+    """Раз на ~90 сек опитує alerts.in.ua і сам вмикає/вимикає паузу
+    хантерства, коли реально лунає/закінчується повітряна тривога.
+    Працює тільки якщо задано ALERTS_API_TOKEN в змінних середовища."""
+    if not ALERTS_API_TOKEN or STATE["chat_id"] is None:
+        return
+    import urllib.request
+    import urllib.error
+
+    url = (
+        f"https://api.alerts.in.ua/v1/iot/active_air_raid_alerts/{ALERTS_REGION_UID}.json"
+        f"?token={ALERTS_API_TOKEN}"
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            raw = resp.read().decode("utf-8")
+        status = json.loads(raw)  # повертає рядок: "A" (тривога), "P" (часткова), "N" (немає)
+        active = status in ("A", "P")
+    except (urllib.error.URLError, ValueError, KeyError) as e:
+        log.warning("alerts.in.ua polling failed: %s", e)
+        return
+
+    if active != STATE.get("air_raid_active"):
+        await set_air_raid(context, active, source="auto")
 
 
 async def noon_broadcast(context: ContextTypes.DEFAULT_TYPE):
@@ -816,6 +904,7 @@ def main():
 
     jq = app.job_queue
     jq.run_repeating(periodic_check, interval=300, first=10)  # кожні 5 хв
+    jq.run_repeating(check_air_raid_api, interval=90, first=15)  # авто-тривога, кожні 90 сек
     jq.run_daily(morning_prompt, time=dtime(hour=9, minute=0, tzinfo=TZ))
     jq.run_daily(noon_broadcast, time=dtime(hour=12, minute=0, tzinfo=TZ))
 
