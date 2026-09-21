@@ -29,6 +29,13 @@ Hunter J087 Telegram Bot
   всіх автоматичних нагадувань (checkin, "ще ніхто не почав").
   Якщо задано ALERTS_API_TOKEN — бот сам стежить за тривогою в м. Києві
   через alerts.in.ua і вмикає/вимикає паузу автоматично.
+
+Автозавершення і втома:
+  Якщо зміна залишається активною після 22:00 — бот сам її завершує
+  і сповіщає групу (щоб забуті відкриті зміни не висіли до ранку).
+  Раз на 4 години від початку ПЕРШОЇ зміни хантера за день (передача
+  зміни цей відлік не скидає) бот питає, чи не втомився хантер і чи
+  не хоче передати зміну — з кнопками "продовжую" / "передати".
 """
 
 import json
@@ -53,6 +60,8 @@ log = logging.getLogger("hunter-bot")
 TZ = ZoneInfo("Europe/Kyiv")
 STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+FATIGUE_INTERVAL_HOURS = 4       # раз на скільки годин питати "чи не втомився хантер"
+AUTO_END_HOUR = 22               # година, після якої бот сам завершує активну зміну
 
 DEFAULT_STATE = {
     "chat_id": None,
@@ -69,6 +78,8 @@ DEFAULT_STATE = {
     "last_missing_alert": None,
     "hunter_done_today": False,   # True, якщо хантерство сьогодні вже відбулось і завершилось
     "air_raid_active": False,     # True на час повітряної тривоги — паузить нагадування
+    "shift_started_at": None,   # час початку ПЕРШОЇ зміни хантера сьогодні (не скидається при передачі)
+    "last_fatigue_slot": -1,    # який 4-годинний проміжок вже питали "чи не втомився"
     "pending_input": None,  # {"type": "sethunters"|"activity", "chat_id": ...}
 }
 
@@ -128,6 +139,8 @@ def ensure_today_reset():
         STATE["hunters_schedule_text"] = None
         STATE["schedule_sent_date"] = None
         STATE["hunter_done_today"] = False
+        STATE["shift_started_at"] = None
+        STATE["last_fatigue_slot"] = -1
         save_state(STATE)
 
 
@@ -352,6 +365,8 @@ async def cmd_starthunter(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "employee": name, "start_time": ts, "last_check_in": ts, "transfers": []
     }
     STATE["last_missing_alert"] = None
+    STATE["shift_started_at"] = ts
+    STATE["last_fatigue_slot"] = -1
     save_state(STATE)
     await update.message.reply_text(f"🟢 Hunter почав: {name} ({fmt_time(ts)})")
     await announce(context, f"🟢 Хантерство розпочав {name} ({fmt_time(ts)})")
@@ -386,6 +401,8 @@ async def cmd_endhunter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     STATE["log"].insert(0, {**session, "end_time": end_ts})
     STATE["current_session"] = None
     STATE["hunter_done_today"] = True
+    STATE["shift_started_at"] = None
+    STATE["last_fatigue_slot"] = -1
     save_state(STATE)
     await update.message.reply_text(
         f"🔴 Hunter завершено. Тривалість: {fmt_duration(duration)}"
@@ -587,6 +604,8 @@ async def on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         STATE["log"].insert(0, {**session, "end_time": end_ts})
         STATE["current_session"] = None
         STATE["hunter_done_today"] = True
+        STATE["shift_started_at"] = None
+        STATE["last_fatigue_slot"] = -1
         save_state(STATE)
         await query.edit_message_text(
             f"🔴 Хантерство завершено ({session['employee']}). Тривалість: {fmt_duration(duration)}\n\n"
@@ -611,6 +630,8 @@ async def on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "employee": name, "start_time": ts, "last_check_in": ts, "transfers": []
         }
         STATE["last_missing_alert"] = None
+        STATE["shift_started_at"] = ts
+        STATE["last_fatigue_slot"] = -1
         save_state(STATE)
         await query.edit_message_text(
             f"🟢 Хантерство почав: {name} ({fmt_time(ts)})\n\n{main_menu_text()}",
@@ -636,6 +657,37 @@ async def on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=build_main_menu(),
         )
         await announce(context, f"🔄 Хантерство передано: {name} ({fmt_time(ts)})")
+        return
+
+    if data == "fatigue_ok":
+        await query.edit_message_text("✅ Ок, продовжуємо! Гарної зміни 💪")
+        return
+
+    if data == "fatigue_transfer":
+        session = STATE["current_session"]
+        if not session:
+            await query.edit_message_text("Hunter вже не активний.")
+            return
+        await query.edit_message_text(
+            "Кому передати хантерство?",
+            reply_markup=build_employee_menu("fatigue_transfer_emp", exclude={session["employee"]}),
+        )
+        return
+
+    if data.startswith("fatigue_transfer_emp:"):
+        name = data.split(":", 1)[1]
+        session = STATE["current_session"]
+        if not session:
+            await query.edit_message_text("Hunter вже не активний.")
+            return
+        ts = now_iso()
+        session["transfers"].append({"from": session["employee"], "to": name, "time": ts})
+        session["employee"] = name
+        session["last_check_in"] = ts
+        save_state(STATE)
+        await query.edit_message_text(f"🔄 Хантерство передано: {name} ({fmt_time(ts)})")
+        await announce(context, f"🔄 Хантерство передано: {name} ({fmt_time(ts)})")
+        await ensure_pinned_menu(context)
         return
 
     if data == "menu_settings":
@@ -740,7 +792,28 @@ async def periodic_check(context: ContextTypes.DEFAULT_TYPE):
     session = STATE["current_session"]
 
     if session:
-        elapsed = (datetime.now(TZ) - parse_iso(session["last_check_in"])).total_seconds()
+        now = datetime.now(TZ)
+
+        # авто-завершення після 22:00 — працівники інколи забувають закрити зміну вручну
+        if now.hour >= AUTO_END_HOUR:
+            end_ts = now_iso()
+            duration = (now - parse_iso(session["start_time"])).total_seconds()
+            STATE["log"].insert(0, {**session, "end_time": end_ts})
+            STATE["current_session"] = None
+            STATE["hunter_done_today"] = True
+            STATE["shift_started_at"] = None
+            STATE["last_fatigue_slot"] = -1
+            save_state(STATE)
+            await announce(
+                context,
+                f"🔴 Зміну автоматично завершено о {AUTO_END_HOUR}:00 ({session['employee']}). "
+                f"Тривалість: {fmt_duration(duration)}\n"
+                f"⚠️ Не забувай завершувати хантерство вручну наступного разу.",
+            )
+            await ensure_pinned_menu(context)
+            return
+
+        elapsed = (now - parse_iso(session["last_check_in"])).total_seconds()
         threshold = STATE["interval_hours"] * 3600
         if elapsed >= threshold:
             keyboard = InlineKeyboardMarkup(
@@ -760,6 +833,31 @@ async def periodic_check(context: ContextTypes.DEFAULT_TYPE):
             # щохвилини, поки хантер не підтвердить кнопкою
             session["last_check_in"] = now_iso()
             save_state(STATE)
+
+        # питання про втому — кожні FATIGUE_INTERVAL_HOURS годин від початку
+        # ПЕРШОЇ зміни хантера сьогодні (передача зміни цей відлік не скидає)
+        shift_start = STATE.get("shift_started_at")
+        if shift_start:
+            elapsed_since_start = (now - parse_iso(shift_start)).total_seconds()
+            slot = int(elapsed_since_start // (FATIGUE_INTERVAL_HOURS * 3600))
+            if slot > 0 and slot > STATE.get("last_fatigue_slot", -1):
+                fatigue_keyboard = InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("✅ Все ок, продовжую", callback_data="fatigue_ok")],
+                        [InlineKeyboardButton("🔄 Так, хочу передати зміну", callback_data="fatigue_transfer")],
+                    ]
+                )
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    message_thread_id=STATE.get("thread_id"),
+                    text=(
+                        f"⏰ {session['employee']}, ти вже {FATIGUE_INTERVAL_HOURS} год на хантерстві.\n"
+                        f"Не втомився? Можливо, час передати зміну наступному хантеру?"
+                    ),
+                    reply_markup=fatigue_keyboard,
+                )
+                STATE["last_fatigue_slot"] = slot
+                save_state(STATE)
         return
 
     # немає активного хантера — з 13:00 нагадуємо щоразу через 15 хв,
@@ -833,7 +931,12 @@ async def noon_broadcast(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(
         chat_id=STATE["chat_id"],
         message_thread_id=STATE.get("thread_id"),
-        text=f"🗒 Розклад хантерів на сьогодні:\n{schedule}",
+        text=(
+            f"👋 Всім привіт!\n\n"
+            f"Нагадую зараз проходить активність: {STATE['activity_text']}\n\n"
+            f"Давайте поторгуємо! 💪\n\n"
+            f"🗒 Хантери на сьогодні:\n{schedule}"
+        ),
     )
     STATE["schedule_sent_date"] = today_str()
     save_state(STATE)
