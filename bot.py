@@ -47,16 +47,35 @@ Hunter J087 Telegram Bot
   хантер і чи не хоче передати зміну (для першого хантера передача зміни
   цей відлік не скидає) — з кнопками "продовжую" / "передати".
 
+Теги і реєстрація:
+  Кожен працівник один раз пише боту в ОСОБИСТІ, натискає Start і обирає себе
+  зі списку (/register). Після цього бот тегає його в групі (старт, передача,
+  «ти на місці?», «не втомився?») і може писати йому в особисті.
+  Керівнику: /who — хто вже зареєстрований, /unreg Прізвище Ім'я — відв'язати.
+
+Опитування після зміни:
+  Коли відрізок зміни працівника завершився (передача, завершення, автозавершення
+  о 22:00) і він тривав щонайменше 2 години — бот пише йому в особисті:
+  скільком запропонував допомогу, скільки закінчилось покупкою, скількох
+  проінформував про акцію, самооцінка зміни 1–5. Коротшим відрізкам опитування не йде.
+
+Тижневий звіт:
+  У змінній OWNER_ID задай свій Telegram ID (його покаже /myid) і натисни Start
+  у чаті з ботом. Щопонеділка після 09:30 прийде звіт за минулий тиждень:
+  години по людях, «ти на місці?» (підтверджено/надіслано), відповіді опитувань
+  з позначкою ⚠️ там, де відповіді не сходяться. /report — звіт за 7 днів у будь-який момент.
+
 Збереження даних:
   За замовчуванням стан лежить у state.json поряд з ботом. На Railway
   підключи Volume (наприклад, на /data) і задай змінну STATE_FILE=/data/state.json,
   щоб дані переживали перезапуск і новий деплой.
 """
 
+import html
 import json
 import logging
 import os
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
@@ -80,6 +99,20 @@ ALERTS_REGION_UID = os.environ.get("ALERTS_REGION_UID", "31")  # 31 = м. Киї
 FATIGUE_INTERVAL_HOURS = 4       # раз на скільки годин питати "чи не втомився хантер"
 AUTO_END_HOUR = 22               # година, після якої бот сам завершує активну зміну
 AIR_RAID_AUTO_OFF_HOURS = 3      # через скільки годин бот сам знімає тривогу, якщо забули натиснути "Відбій"
+SURVEY_MIN_MINUTES = 120         # опитування отримують лише ті, чий відрізок зміни тривав не менше 2 годин
+OWNER_ID = os.environ.get("OWNER_ID", "").strip()   # твій Telegram ID (дізнатись: /myid) — для тижневого звіту
+
+# Питання опитування після зміни: (текст, варіанти відповіді)
+SURVEY_QUESTIONS = [
+    ("Скільком покупцям запропонував допомогу?", ["0", "1–5", "6–15", "16+"]),
+    ("Скільки з цих розмов закінчилось покупкою, приблизно?", ["0", "1–2", "3–5", "6+"]),
+    ("Скількох покупців проінформував про нашу поточну акцію?", ["0", "1–5", "6–15", "16+"]),
+    ("Як оцінюєш свою зміну? (1 — слабко, 5 — відмінно)", ["1", "2", "3", "4", "5"]),
+]
+# для перевірки логіки відповідей: нижня/верхня межа кожного варіанту питань 1 і 2
+Q1_LOW, Q1_HIGH = [0, 1, 6, 16], [0, 5, 15, 10**6]
+Q2_LOW = [0, 1, 3, 6]
+WEEKDAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "нд"]
 
 # Стандартний список працівників. Змінюєш список тут і піднімаєш EMPLOYEES_VERSION —
 # при наступному запуску бот один раз перезапише збережений список цим.
@@ -135,6 +168,11 @@ DEFAULT_STATE = {
     "shift_started_at": None,   # час початку ПЕРШОЇ зміни хантера сьогодні (не скидається при передачі)
     "last_fatigue_slot": -1,    # який 4-годинний проміжок вже питали "чи не втомився"
     "pending_input": None,  # {"type": "sethunters"|"activity", "chat_id": ...}
+    "users": {},             # {"Прізвище Ім'я": telegram_user_id} — для тегів і опитувань
+    "segments": [],          # завершені відрізки: один працівник безперервно на хантерстві
+    "surveys": {},           # {"id": опитування після відрізка зміни}
+    "next_id": 1,
+    "last_report_week": None,  # понеділок (YYYY-MM-DD) тижня, коли востаннє слали звіт
 }
 
 
@@ -243,10 +281,36 @@ def slot_label(slot):
     return "" if slot == "main" else " (другий хантер)"
 
 
+def close_segment(slot, session, end_ts):
+    """Фіксує відрізок «один працівник безперервно на хантерстві». Якщо він тривав
+    не менше SURVEY_MIN_MINUTES — ставить у чергу опитування для цього працівника."""
+    start = session.get("seg_start") or session["start_time"]
+    minutes = (parse_iso(end_ts) - parse_iso(start)).total_seconds() / 60
+    sid = STATE["next_id"]
+    STATE["next_id"] = sid + 1
+    seg = {
+        "id": sid, "employee": session["employee"], "start": start, "end": end_ts,
+        "slot": slot, "minutes": round(minutes, 1),
+    }
+    STATE["segments"].append(seg)
+    STATE["segments"] = STATE["segments"][-800:]
+    if minutes >= SURVEY_MIN_MINUTES:
+        STATE["surveys"][str(sid)] = {
+            "id": sid, "employee": seg["employee"], "start": start, "end": end_ts,
+            "minutes": seg["minutes"], "slot": slot, "status": "queued", "answers": {},
+        }
+        # старі опитування не накопичуємо безкінечно
+        if len(STATE["surveys"]) > 400:
+            for k in sorted(STATE["surveys"], key=int)[:-400]:
+                del STATE["surveys"][k]
+    return seg
+
+
 def do_start(slot, name):
     ts = now_iso()
     STATE[SLOT_KEYS[slot]] = {
-        "employee": name, "start_time": ts, "last_check_in": ts, "transfers": []
+        "employee": name, "start_time": ts, "last_check_in": ts, "transfers": [],
+        "seg_start": ts, "stats": {},
     }
     STATE["last_missing_alert"] = None
     if slot == "main":
@@ -259,8 +323,10 @@ def do_start(slot, name):
 def do_transfer(slot, name):
     session = get_session(slot)
     ts = now_iso()
+    close_segment(slot, session, ts)
     session["transfers"].append({"from": session["employee"], "to": name, "time": ts})
     session["employee"] = name
+    session["seg_start"] = ts
     session["last_check_in"] = ts
     save_state(STATE)
     return ts
@@ -270,7 +336,9 @@ def do_end(slot):
     session = get_session(slot)
     end_ts = now_iso()
     duration = (parse_iso(end_ts) - parse_iso(session["start_time"])).total_seconds()
+    close_segment(slot, session, end_ts)
     STATE["log"].insert(0, {**session, "end_time": end_ts, "slot": slot})
+    del STATE["log"][400:]
     STATE[SLOT_KEYS[slot]] = None
     if slot == "main":
         STATE["shift_started_at"] = None
@@ -342,18 +410,33 @@ async def ensure_pinned_menu(context: ContextTypes.DEFAULT_TYPE) -> None:
     await push_pinned(context, main_menu_text(), build_main_menu())
 
 
-async def announce(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+def tag(name):
+    """Ім'я як тег (клікабельна згадка), якщо працівник зареєстрований; інакше просто ім'я.
+    Повертає HTML — використовувати з parse_mode=HTML."""
+    uid = STATE.get("users", {}).get(name)
+    esc = html.escape(name)
+    if uid:
+        return f'<a href="tg://user?id={uid}">{esc}</a>'
+    return esc
+
+
+async def announce(context: ContextTypes.DEFAULT_TYPE, text: str, mention: str = None) -> None:
     """Надсилає ОКРЕМЕ повідомлення в групу (на відміну від редагування
     закріпленого меню) — щоб старт/передача/завершення хантерства були
-    помітні у стрічці чату, а не губились у тихому редагуванні pinned-меню."""
+    помітні у стрічці чату, а не губились у тихому редагуванні pinned-меню.
+    mention — ім'я працівника, яке треба замінити на тег (якщо він зареєстрований)."""
     chat_id = STATE.get("chat_id")
     if not chat_id:
         return
+    body = html.escape(text)
+    if mention:
+        body = body.replace(html.escape(mention), tag(mention), 1)
     try:
         await context.bot.send_message(
             chat_id=chat_id,
             message_thread_id=STATE.get("thread_id"),
-            text=text,
+            text=body,
+            parse_mode="HTML",
         )
     except Exception as e:
         log.error("announce failed: %s", e)
@@ -515,7 +598,7 @@ async def cmd_starthunter(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     ts = do_start("main", name)
     await update.message.reply_text(f"🟢 Hunter почав: {name} ({fmt_time(ts)})")
-    await announce(context, start_announcement("main", name, ts))
+    await announce(context, start_announcement("main", name, ts), mention=name)
 
 
 async def cmd_transferhunter(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -531,7 +614,7 @@ async def cmd_transferhunter(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     ts = do_transfer("main", name)
     await update.message.reply_text(f"🔄 Hunter передано: {name} ({fmt_time(ts)})")
-    await announce(context, transfer_announcement("main", name, ts))
+    await announce(context, transfer_announcement("main", name, ts), mention=name)
 
 
 async def cmd_endhunter(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -818,7 +901,7 @@ async def on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{start_announcement(slot, name, ts)}\n\n{main_menu_text()}",
             reply_markup=build_main_menu(),
         )
-        await announce(context, start_announcement(slot, name, ts))
+        await announce(context, start_announcement(slot, name, ts), mention=name)
         return
 
     if head == "transfer_emp":
@@ -836,7 +919,7 @@ async def on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{transfer_announcement(slot, name, ts)}\n\n{main_menu_text()}",
             reply_markup=build_main_menu(),
         )
-        await announce(context, transfer_announcement(slot, name, ts))
+        await announce(context, transfer_announcement(slot, name, ts), mention=name)
         return
 
     if head == "fatigue_ok":
@@ -863,7 +946,7 @@ async def on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         ts = do_transfer(slot, name)
         await query.edit_message_text(transfer_announcement(slot, name, ts))
-        await announce(context, transfer_announcement(slot, name, ts))
+        await announce(context, transfer_announcement(slot, name, ts), mention=name)
         await ensure_pinned_menu(context)
         return
 
@@ -950,12 +1033,360 @@ async def on_checkin_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = get_session(slot)
     if session:
         session["last_check_in"] = now_iso()
+        st = session.setdefault("stats", {}).setdefault(session["employee"], {"sent": 0, "ok": 0})
+        st["ok"] += 1
         save_state(STATE)
         await query.edit_message_text(
             f"✅ Підтверджено: {session['employee']} на місці й проінформував покупців."
         )
     else:
         await query.edit_message_text("Hunter вже не активний.")
+
+
+# ---------------- реєстрація працівників (для тегів і опитувань) ----------------
+
+def first_name(full):
+    """«Балема Владислав» -> «Владислав» (у списку спочатку прізвище)."""
+    parts = full.split()
+    return parts[-1] if parts else full
+
+
+def is_owner(update: Update) -> bool:
+    return bool(OWNER_ID) and str(update.effective_user.id) == OWNER_ID
+
+
+def build_register_menu(user_id):
+    users = STATE["users"]
+    rows, row = [], []
+    for name in STATE["employees"]:
+        if users.get(name) == user_id:
+            mark = "✅ "
+        elif name in users:
+            mark = "🔒 "
+        else:
+            mark = ""
+        row.append(InlineKeyboardButton(mark + name, callback_data=f"reg:{name}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """У особистих — реєстрація працівника, у групі — довідка."""
+    if update.effective_chat.type == "private":
+        await cmd_register(update, context)
+    else:
+        await cmd_help(update, context)
+
+
+async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        await update.message.reply_text(
+            "Реєстрація — в особистих повідомленнях: відкрий чат зі мною, натисни Start і обери себе зі списку."
+        )
+        return
+    await update.message.reply_text(
+        "Привіт! 👋 Обери себе зі списку — після цього я зможу тегати тебе в групі "
+        "та надсилати короткий опитувальник після твоєї зміни хантера.\n\n"
+        "✅ — це ти, 🔒 — ім'я вже закріплене за іншою людиною.",
+        reply_markup=build_register_menu(update.effective_user.id),
+    )
+
+
+async def on_register_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    name = query.data.partition(":")[2]
+    uid = query.from_user.id
+    if name not in STATE["employees"]:
+        await query.answer("Такого працівника немає в списку.", show_alert=True)
+        return
+    holder = STATE["users"].get(name)
+    if holder and holder != uid:
+        await query.answer("Це ім'я вже закріплене за іншою людиною. Напиши керівнику.", show_alert=True)
+        return
+    await query.answer()
+    for n, u in list(STATE["users"].items()):
+        if u == uid and n != name:
+            del STATE["users"][n]
+    STATE["users"][name] = uid
+    # опитування за останню добу, які не вдалось доставити, відправимо тепер
+    now = datetime.now(TZ)
+    for s in STATE["surveys"].values():
+        if (s["employee"] == name and s["status"] == "undelivered"
+                and (now - parse_iso(s["end"])).total_seconds() < 24 * 3600):
+            s["status"] = "queued"
+    save_state(STATE)
+    await query.edit_message_text(
+        f"✅ Готово, {name}! Тепер я тегатиму тебе в групі й надсилатиму опитування після зміни.\n\n"
+        f"Обрав не те ім'я — просто натисни /register ще раз.",
+    )
+
+
+async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"Твій Telegram ID: {update.effective_user.id}\n"
+        f"Щоб отримувати тижневий звіт — задай його у Railway як змінну OWNER_ID "
+        f"і натисни Start у чаті зі мною."
+    )
+
+
+async def cmd_who(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Для керівника: хто вже зареєстрований, а хто ні."""
+    if not is_owner(update):
+        return
+    users = STATE["users"]
+    done = [n for n in STATE["employees"] if n in users]
+    todo = [n for n in STATE["employees"] if n not in users]
+    await update.message.reply_text(
+        f"✅ Зареєстровані ({len(done)}):\n" + ("\n".join(f"• {n}" for n in done) or "—")
+        + f"\n\n⏳ Ще ні ({len(todo)}):\n" + ("\n".join(f"• {n}" for n in todo) or "—")
+    )
+
+
+async def cmd_unreg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Для керівника: відв'язати працівника, щоб він міг зареєструватись заново."""
+    if not is_owner(update):
+        return
+    name = " ".join(context.args).strip()
+    if name in STATE["users"]:
+        del STATE["users"][name]
+        save_state(STATE)
+        await update.message.reply_text(f"🗑 {name} відв'язано. Може зареєструватись знову через /register.")
+    else:
+        await update.message.reply_text("Використання: /unreg Прізвище Ім'я (як у списку працівників).")
+
+
+# ---------------- опитування після зміни ----------------
+
+def survey_text(s, q):
+    """q — номер питання, з 1."""
+    span = f"{fmt_time(s['start'])}–{fmt_time(s['end'])}"
+    if q == 1:
+        head = (
+            f"Привіт, {first_name(s['employee'])}! 👋 Твоя зміна завершена ({span}). "
+            f"Оціни її та дай відповіді на питання.\n\n"
+        )
+    else:
+        head = f"Зміна {span}\n\n"
+    question = SURVEY_QUESTIONS[q - 1][0]
+    if q == 3:
+        question += f"\n«{STATE['activity_text']}»"
+    return f"{head}{q}/{len(SURVEY_QUESTIONS)}. {question}"
+
+
+def survey_markup(s, q):
+    options = SURVEY_QUESTIONS[q - 1][1]
+    row = [
+        InlineKeyboardButton(opt, callback_data=f"sv:{s['id']}:{q}:{i}")
+        for i, opt in enumerate(options)
+    ]
+    return InlineKeyboardMarkup([row])
+
+
+async def survey_dispatch(context: ContextTypes.DEFAULT_TYPE):
+    """Раз на 30 сек розсилає опитування, які стоять у черзі, у приватні повідомлення."""
+    changed = False
+    for s in list(STATE["surveys"].values()):
+        if s["status"] != "queued":
+            continue
+        changed = True
+        name = s["employee"]
+        uid = STATE["users"].get(name)
+        if uid:
+            try:
+                await context.bot.send_message(
+                    chat_id=uid, text=survey_text(s, 1), reply_markup=survey_markup(s, 1)
+                )
+                s["status"] = "sent"
+                s["user_id"] = uid
+                s["sent_at"] = now_iso()
+                save_state(STATE)
+                continue
+            except Exception as e:
+                log.warning("Не вдалось надіслати опитування %s: %s", name, e)
+        s["status"] = "undelivered"
+        save_state(STATE)
+        await announce(
+            context,
+            f"📩 {name}, не можу надіслати тобі опитування по зміні. "
+            f"Відкрий чат зі мною, натисни Start і обери себе зі списку (/register) — "
+            f"опитування прийде одразу.",
+            mention=name,
+        )
+    if changed:
+        save_state(STATE)
+
+
+async def on_survey_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        _, sid, q, idx = query.data.split(":")
+        q, idx = int(q), int(idx)
+    except ValueError:
+        await query.answer()
+        return
+    s = STATE["surveys"].get(sid)
+    if (not s or s["status"] != "sent" or query.from_user.id != s.get("user_id")
+            or q != len(s["answers"]) + 1 or q > len(SURVEY_QUESTIONS)
+            or not 0 <= idx < len(SURVEY_QUESTIONS[q - 1][1])):
+        await query.answer()  # повторне натискання або чуже опитування
+        return
+    await query.answer()
+    s["answers"][str(q)] = idx
+    if q < len(SURVEY_QUESTIONS):
+        save_state(STATE)
+        await query.edit_message_text(survey_text(s, q + 1), reply_markup=survey_markup(s, q + 1))
+        return
+    s["status"] = "done"
+    s["answered_at"] = now_iso()
+    save_state(STATE)
+    await query.edit_message_text("Дякую! ✅ Відповіді записано. Гарного дня 💪")
+
+
+# ---------------- тижневий звіт ----------------
+
+def survey_flags(s):
+    """Підозрілі розбіжності у відповідях — щоб керівник міг уточнити в людини."""
+    a = s["answers"]
+    flags = []
+    if len(a) >= 2 and Q2_LOW[a["2"]] > Q1_HIGH[a["1"]]:
+        flags.append("покупок більше, ніж розмов")
+    if a.get("1") == 0 and s["minutes"] >= 180:
+        flags.append(f"0 розмов за {fmt_duration(s['minutes'] * 60)}")
+    return flags
+
+
+def survey_line(s):
+    day = WEEKDAYS[parse_iso(s["start"]).weekday()]
+    head = f"{day} {fmt_time(s['start'])}–{fmt_time(s['end'])} {s['employee']}"
+    if s["status"] == "done":
+        a = s["answers"]
+        opts = [SURVEY_QUESTIONS[i][1][a[str(i + 1)]] for i in range(len(SURVEY_QUESTIONS))]
+        line = f"• {head}: розмов {opts[0]} · покупок {opts[1]} · про акцію {opts[2]} · оцінка {opts[3]}/5"
+        flags = survey_flags(s)
+        if flags:
+            line += " ⚠️ " + "; ".join(flags)
+        return line
+    if s["status"] == "undelivered":
+        return f"• {head}: 📭 опитування не доставлено (не зареєстрований у боті)"
+    return f"• {head}: ⏳ без відповіді"
+
+
+def build_report(start, end):
+    """Текст звіту за період [start, end)."""
+    segs = [g for g in STATE["segments"] if start <= parse_iso(g["start"]) < end]
+    surveys = sorted(
+        (s for s in STATE["surveys"].values() if start <= parse_iso(s["start"]) < end),
+        key=lambda s: s["start"],
+    )
+    title = f"📊 Звіт Hunter J087: {start:%d.%m}–{(end - timedelta(seconds=1)):%d.%m}"
+    if not segs:
+        return title + "\n\nЗа цей період хантерства не було."
+
+    total_min = sum(g["minutes"] for g in segs)
+    days = {parse_iso(g["start"]).date() for g in segs}
+    span_days = max(1, round((end - start).total_seconds() / 86400))
+
+    # check-in статистика по людях — із завершених і активних змін
+    sessions = [e for e in STATE["log"] if start <= parse_iso(e["start_time"]) < end]
+    sessions += [s for _, s in active_sessions() if start <= parse_iso(s["start_time"]) < end]
+    checks = {}
+    for sess in sessions:
+        for emp, st in sess.get("stats", {}).items():
+            c = checks.setdefault(emp, {"sent": 0, "ok": 0})
+            c["sent"] += st["sent"]
+            c["ok"] += st["ok"]
+
+    per = {}
+    for g in segs:
+        p = per.setdefault(g["employee"], {"min": 0, "n": 0})
+        p["min"] += g["minutes"]
+        p["n"] += 1
+    sv_per = {}
+    for s in surveys:
+        p = sv_per.setdefault(s["employee"], {"all": 0, "done": 0})
+        p["all"] += 1
+        p["done"] += s["status"] == "done"
+
+    lines = [
+        title,
+        "",
+        f"Хантерство: {fmt_duration(total_min * 60)} · відрізків зміни: {len(segs)} · "
+        f"днів із хантером: {len(days)} з {span_days}",
+        "",
+        "По людях:",
+    ]
+    for emp, p in sorted(per.items(), key=lambda kv: -kv[1]["min"]):
+        extra = []
+        c = checks.get(emp)
+        if c and c["sent"]:
+            extra.append(f"«ти на місці?» {c['ok']}/{c['sent']}")
+        sp = sv_per.get(emp)
+        if sp:
+            extra.append(f"опитування {sp['done']}/{sp['all']}")
+        tail = (" · " + " · ".join(extra)) if extra else ""
+        lines.append(f"• {emp} — {fmt_duration(p['min'] * 60)} ({p['n']} відр.){tail}")
+
+    if surveys:
+        done = sum(s["status"] == "done" for s in surveys)
+        lines += ["", f"Опитування після зміни (від {SURVEY_MIN_MINUTES // 60} год): "
+                      f"відповіли {done} з {len(surveys)}"]
+        shown = surveys[:30]
+        lines += [survey_line(s) for s in shown]
+        if len(surveys) > len(shown):
+            lines.append(f"… і ще {len(surveys) - len(shown)}")
+    else:
+        lines += ["", f"Опитувань не було (відрізків зміни від {SURVEY_MIN_MINUTES // 60} год не набралось)."]
+    return "\n".join(lines)
+
+
+async def send_report(context: ContextTypes.DEFAULT_TYPE, start, end, chat_id=None) -> bool:
+    target = chat_id or (int(OWNER_ID) if OWNER_ID.isdigit() else None)
+    if not target:
+        return False
+    text = build_report(start, end)
+    try:
+        # Telegram ліміт — 4096 символів на повідомлення
+        while text:
+            cut = len(text) if len(text) <= 3900 else text.rfind("\n", 0, 3900)
+            cut = cut if cut > 0 else 3900
+            await context.bot.send_message(chat_id=target, text=text[:cut])
+            text = text[cut:].lstrip("\n")
+        return True
+    except Exception as e:
+        log.warning("Не вдалось надіслати звіт (чи натиснув власник Start у боті?): %s", e)
+        return False
+
+
+async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Для керівника: звіт за останні 7 днів, коли потрібно."""
+    if not is_owner(update):
+        return
+    now = datetime.now(TZ)
+    await send_report(context, now - timedelta(days=7), now, chat_id=update.effective_chat.id)
+
+
+async def weekly_report_job(context: ContextTypes.DEFAULT_TYPE):
+    """У понеділок після 09:30 надсилає власнику звіт за минулий тиждень (раз на тиждень).
+    Перевірка щопівгодини, тому якщо бот був вимкнений у понеділок — звіт прийде, щойно ввімкнеться."""
+    if not OWNER_ID:
+        return
+    now = datetime.now(TZ)
+    monday = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    key = monday.strftime("%Y-%m-%d")
+    if STATE.get("last_report_week") is None:
+        # перший запуск після оновлення — не шлемо порожній звіт, чекаємо понеділок
+        STATE["last_report_week"] = key
+        save_state(STATE)
+        return
+    if STATE["last_report_week"] == key or now < monday.replace(hour=9, minute=30):
+        return
+    if await send_report(context, monday - timedelta(days=7), monday):
+        STATE["last_report_week"] = key
+        save_state(STATE)
 
 
 # ---------------- фонові перевірки ----------------
@@ -989,15 +1420,18 @@ async def check_session(context: ContextTypes.DEFAULT_TYPE, slot: str, session: 
             chat_id=chat_id,
             message_thread_id=STATE.get("thread_id"),
             text=(
-                f"⏰ {session['employee']}, ти на місці?{label}\n"
-                f"Активність: {STATE['activity_text']}\n\n"
+                f"⏰ {tag(session['employee'])}, ти на місці?{label}\n"
+                f"Активність: {html.escape(STATE['activity_text'])}\n\n"
                 f"Проінформував покупців про нашу активність?"
             ),
             reply_markup=keyboard,
+            parse_mode="HTML",
         )
         # позначаємо момент відправки нагадування, щоб не дублювати його
         # щохвилини, поки хантер не підтвердить кнопкою
         session["last_check_in"] = now_iso()
+        st = session.setdefault("stats", {}).setdefault(session["employee"], {"sent": 0, "ok": 0})
+        st["sent"] += 1
         save_state(STATE)
 
     # питання про втому — кожні FATIGUE_INTERVAL_HOURS годин від початку зміни
@@ -1022,10 +1456,11 @@ async def check_session(context: ContextTypes.DEFAULT_TYPE, slot: str, session: 
                 chat_id=chat_id,
                 message_thread_id=STATE.get("thread_id"),
                 text=(
-                    f"⏰ {session['employee']}, ти вже {FATIGUE_INTERVAL_HOURS} год на хантерстві.{label}\n"
+                    f"⏰ {tag(session['employee'])}, ти вже {FATIGUE_INTERVAL_HOURS} год на хантерстві.{label}\n"
                     f"Не втомився? Можливо, час передати зміну наступному хантеру?"
                 ),
                 reply_markup=fatigue_keyboard,
+                parse_mode="HTML",
             )
             if slot == "main":
                 STATE["last_fatigue_slot"] = fslot
@@ -1163,6 +1598,7 @@ async def post_init(app: Application) -> None:
         BotCommand("status", "Поточний статус"),
         BotCommand("employees", "Список працівників"),
         BotCommand("sethunters", "Задати розклад хантерів"),
+        BotCommand("register", "Зареєструватись (теги й опитування)"),
         BotCommand("help", "Список команд"),
     ])
 
@@ -1174,7 +1610,12 @@ def main():
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("start", cmd_help))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("register", cmd_register))
+    app.add_handler(CommandHandler("myid", cmd_myid))
+    app.add_handler(CommandHandler("who", cmd_who))
+    app.add_handler(CommandHandler("unreg", cmd_unreg))
+    app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
     app.add_handler(CommandHandler("employees", cmd_employees))
     app.add_handler(CommandHandler("addemployee", cmd_addemployee))
@@ -1190,12 +1631,16 @@ def main():
     app.add_handler(CommandHandler("setactivity", cmd_setactivity))
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CallbackQueryHandler(on_checkin_button, pattern="^checkin2?$"))
+    app.add_handler(CallbackQueryHandler(on_register_callback, pattern="^reg:"))
+    app.add_handler(CallbackQueryHandler(on_survey_callback, pattern="^sv:"))
     app.add_handler(CallbackQueryHandler(on_menu_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_input))
 
     jq = app.job_queue
     jq.run_repeating(periodic_check, interval=300, first=10)  # кожні 5 хв
     jq.run_repeating(check_air_raid_api, interval=90, first=15)  # авто-тривога, кожні 90 сек
+    jq.run_repeating(survey_dispatch, interval=30, first=20)  # опитування після зміни
+    jq.run_repeating(weekly_report_job, interval=1800, first=60)  # тижневий звіт власнику
     jq.run_daily(morning_prompt, time=dtime(hour=9, minute=0, tzinfo=TZ))
     jq.run_daily(noon_broadcast, time=dtime(hour=12, minute=0, tzinfo=TZ))
 
@@ -1205,4 +1650,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
